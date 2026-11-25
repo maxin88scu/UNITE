@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 
-
 class Model(torch.nn.Module):
     def __init__(self, args):
         super(Model, self).__init__()
