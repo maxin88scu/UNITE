@@ -9,8 +9,8 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('--seed', type=int, default=0, help='random seed')
 parser.add_argument('--nhid', type=int, default=512, help='hidden size')
-parser.add_argument('--lr', type=float, default=0.001, help='learning rate 0.005')
-parser.add_argument('--weight_decay', type=float, default=1e-3, help='weight decay 0.001')
+parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
+parser.add_argument('--weight_decay', type=float, default=1e-3, help='weight decay')
 parser.add_argument('--dropout_ratio', type=float, default=0.1, help='dropout ratio')
 parser.add_argument('--known_class', type=int, default=3, help='number of known classes')
 parser.add_argument('--device', type=str, default='cuda', help='specify cuda devices')
@@ -19,31 +19,19 @@ parser.add_argument('--source', type=str, default='ACMv9', help='source domain d
 parser.add_argument('--target', type=str, default='Citationv1', help='target domain data, DBLPv7/ACMv9/Citationv1')
 parser.add_argument("--lblToRemove1", type=int, default=0, help='first label to remove for source domain data')
 parser.add_argument("--lblToRemove2", type=int, default=1, help='second label to remove for source domain data')
-parser.add_argument("--topk", type=int, default=2, help="the number of topk elements of logits")
+parser.add_argument("--topk", type=int, default=2, help="the number of topk elements")
 parser.add_argument("--beta", type=float, default=0.99, help="none")
 parser.add_argument("--gamma", type=float, default=0.02, help="none")
 parser.add_argument("--temperature", type=float, default=0.5, help="temperature for contrastive learning")
-parser.add_argument("--threshold", type=float, default=0.75, help="none")
 parser.add_argument("--times", type=int, default=10, help="run times")
-parser.add_argument("--weight", type=float, default=0.2, help="weight of loss_t_cls")
-
-
+parser.add_argument("--weight", type=float, default=0.2, help="weight")
 parser.add_argument('--num_layers', type=int, default=2, help='number of layers')
-parser.add_argument('--make_undirected', type=bool, default=True, help='directed graph or not')
 
 args = parser.parse_args()
 
 criterion = nn.CrossEntropyLoss().to(args.device)
 
-
-
-
-def entropy(p):
-    p = F.softmax(p, dim=1)
-    return -torch.mean(torch.sum(p * torch.log(p + 1e-5), 1))
-
-
-def train(epoch,models,optimizer,source_data,target_data):
+def train(epoch,models,optimizer,source_data,target_data,unknown_detector):
     for model in models:
         model.train()
     model1 = models[0]
@@ -56,8 +44,9 @@ def train(epoch,models,optimizer,source_data,target_data):
 
     encoded_source2 = model2.feat_bottleneck(source_data.x, source_data.edge_index)
     encoded_target2 = model2.feat_bottleneck(target_data.x, target_data.edge_index)
-    logits_source2 = model2.feat_classifier(encoded_source2, source_data.edge_index)
-    logits_target2 = model2.feat_classifier(encoded_target2, target_data.edge_index)
+
+    logits_source2 = model2.feat_classifier(encoded_source2, source_data.edge_index)[:, :args.known_class]
+    logits_target2 = model2.feat_classifier(encoded_target2, target_data.edge_index)[:, :args.known_class]
 
     warm_up = 20
     labels = source_data.y
@@ -67,7 +56,7 @@ def train(epoch,models,optimizer,source_data,target_data):
         loss_s_cls2 = criterion(logits_source2, labels)
         loss = loss_s_cls1 + loss_s_cls2
     else:
-        known_index, unknown_index = distinguish_target(logits_target2, args.beta, args.gamma, args.threshold, args.device)
+        known_index, unknown_index = unknown_detector(logits_source2, logits_target2, target_data.edge_index)
 
         neighbors = get_neighbors(logits_source1, logits_target1, args.topk, args.device)
         loss_ncl = neighbor_contrastive_loss(encoded_source1, encoded_target1, neighbors, args.temperature)
@@ -84,7 +73,9 @@ def train(epoch,models,optimizer,source_data,target_data):
             loss_t_cls = criterion(logits_target1, target_pseudo_label)
         loss_cls = loss_s_cls1 + loss_s_cls2 + loss_t_cls * float(args.weight)
 
-        loss_nc = neighbor_center_contrastive_loss(encoded_source1, encoded_target1, unknown_index, labels, args.device, args.temperature)
+        loss_nc = 0.0
+        if unknown_index[0].numel() > 0:
+            loss_nc = neighbor_center_contrastive_loss(encoded_source1, encoded_target1, unknown_index, labels, args.device, args.temperature)
 
         loss = loss_ncl + loss_cls + loss_nc
 
@@ -93,7 +84,7 @@ def train(epoch,models,optimizer,source_data,target_data):
     optimizer.step()
 
 
-def target_eval(model,source_data,target_data):
+def target_eval(model,target_data):
     model.eval()
 
     with torch.no_grad():
@@ -158,54 +149,36 @@ def main():
         models = [model1, model2]
         params = itertools.chain(*[model.parameters() for model in models])
         optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
+        unknown_detector = UnknownDetector(source_data.y, args.known_class, args.beta, args.gamma)
 
 
         best_acc = 0.0
         best_known_acc = 0.0
         best_unknown_acc = 0.0
         best_H_score = 0.0
-        best_epoch = 0
 
-        #--------------------------------
-        best_acc2 = 0.0
-        best_known_acc2 = 0.0
-        best_unknown_acc2 = 0.0
-        best_H_score2 = 0.0
-        best_epoch2 = 0
-        #-----------------------------
 
         for epoch in range(1, args.epochs + 1):
-            train(epoch,models,optimizer,source_data,target_data)
-            acc, known_acc, unknown_acc, H_score = target_eval(model1,source_data,target_data)
+            train(epoch,models,optimizer,source_data,target_data,unknown_detector)
+            acc, known_acc, unknown_acc, H_score = target_eval(model1,target_data)
 
             if epoch % 10 == 0:
-                print("before epoch:{}, acc:{:.4f}, known_acc:{:.4f}, unknown_acc:{:.4f}, H_score:{:.4f}".format(epoch, acc, known_acc,unknown_acc,H_score))
-            if H_score > best_H_score:
+                print("epoch:{}, acc:{:.4f}, known_acc:{:.4f}, unknown_acc:{:.4f}, H_score:{:.4f}".format(epoch, acc, known_acc,unknown_acc,H_score))
+
+            if acc > best_acc:
                 best_H_score = H_score
                 best_known_acc = known_acc
                 best_unknown_acc = unknown_acc
                 best_acc = acc
-                best_epoch = epoch
-
-            if acc > best_acc2:
-                best_H_score2 = H_score
-                best_known_acc2 = known_acc
-                best_unknown_acc2 = unknown_acc
-                best_acc2 = acc
-                best_epoch2 = epoch
         print("-------------------------------------------------------")
-        print("source:{},target:{},remove_label:{}/{},best epoch:{}, best acc:{:.4f}, best known_acc:{:.4f}, best unknown_acc:{:.4f}, best H_score:{:.4f}".format(args.source,args.target,args.lblToRemove1,args.lblToRemove2,best_epoch, best_acc, best_known_acc, best_unknown_acc, best_H_score))
+        print("source:{},target:{},remove_label:{}/{}, best acc:{:.4f}, best known_acc:{:.4f}, best unknown_acc:{:.4f}, best H_score:{:.4f}".format(args.source,args.target,args.lblToRemove1,args.lblToRemove2, best_acc, best_known_acc, best_unknown_acc, best_H_score))
 
-        print("source:{},target:{},remove_label:{}/{},best epoch2:{}, best acc2:{:.4f}, best known_acc2:{:.4f}, best unknown_acc2:{:.4f}, best H_score2:{:.4f}".format(args.source, args.target, args.lblToRemove1, args.lblToRemove2, best_epoch2, best_acc2, best_known_acc2,best_unknown_acc2, best_H_score2))
         every_best_acc.append(best_acc)
         every_best_known_acc.append(best_known_acc)
         every_best_unknown_acc.append(best_unknown_acc)
         every_best_H_score.append(best_H_score)
 
     every_best_acc_np = np.array(every_best_acc)
-    every_best_known_acc_np = np.array(every_best_known_acc)
-    # every_best_unknown_acc_np = np.array(every_best_unknown_acc)
-    every_best_unknown_acc_np = np.array([tensor.cpu() if isinstance(tensor, torch.Tensor) else tensor for tensor in every_best_unknown_acc])
     every_best_H_score_np = np.array([tensor.cpu() if isinstance(tensor, torch.Tensor) else tensor for tensor in every_best_H_score])
 
     mean_acc = np.mean(every_best_acc_np)
