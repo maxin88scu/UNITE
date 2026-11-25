@@ -8,11 +8,11 @@ import pandas as pd
 from torch_geometric.utils import to_networkx, from_networkx,degree
 from scipy.stats import rankdata
 from sklearn.cluster import KMeans
-from scipy.stats import wasserstein_distance
+import math
 
 class CitationDataset(InMemoryDataset):
     def __init__(self,
-                 root,  # Root directory where the dataset should be saved.
+                 root,
                  name,
                  domain,
                  lblToRemove1,
@@ -20,14 +20,14 @@ class CitationDataset(InMemoryDataset):
                  transform=None,
                  pre_transform=None,
                  pre_filter=None):
-        self.name = name  # dataset name
-        self.domain = domain  # two types: source or target, for different procedures
+        self.name = name
+        self.domain = domain
         self.lblToRemove1 = lblToRemove1
         self.lblToRemove2 = lblToRemove2
         # self.root = root  # data/acmv9
         super(CitationDataset, self).__init__(root, transform, pre_transform, pre_filter)
-        self.process()  # reset the dataset every time
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.process()
+        self.data, self.slices = torch.load(self.processed_paths[0],weights_only=False)
 
     @property
     def raw_file_names(self):
@@ -61,13 +61,12 @@ class CitationDataset(InMemoryDataset):
             line = line.replace("\r", "").replace("\n", "")
             content_list.append(line)
         y = np.array(content_list, dtype=int)
-        y_df = pd.DataFrame(y)  # for delete label use
+        y_df = pd.DataFrame(y)
 
         data = Data(edge_index=edge_index, x=x, y=y)
 
-        label_to_remove = [self.lblToRemove1, self.lblToRemove2]  # for 5 categories
+        label_to_remove = [self.lblToRemove1, self.lblToRemove2]
 
-        # modify source domain data: delete nodes and edges with certain labels
         if self.domain == 'source':
             print("source_name:",self.name)
             print("before_process_source_nodes_of_class:")
@@ -91,7 +90,6 @@ class CitationDataset(InMemoryDataset):
             for i in range(3):
                 print("label:{}, number:{}".format(i, np.count_nonzero(data.y == i)))
 
-        # modify target domain data: combine multiple unseen labels as one label
         if self.domain == 'target':
 
             print("target_name:",self.name)
@@ -133,8 +131,38 @@ class CitationDataset(InMemoryDataset):
         torch.save((data, slices), self.processed_paths[0])
 
 
+class UnknownDetector:
+
+    def __init__(self, source_labels, num_known_classes, beta, gamma):
+        counts = torch.bincount(source_labels, minlength=num_known_classes).float()
+        self.prior = counts / counts.sum()
+        self.beta = beta
+        self.source_rank = max(1, math.ceil(gamma * source_labels.numel()))
+        self.threshold = None
+
+    def _divergence(self, logits):
+        log_probabilities = F.log_softmax(logits, dim=1)
+        return F.kl_div(log_probabilities, self.prior, reduction='none').sum(dim=1)
+
+    @torch.no_grad()
+    def __call__(self, source_logits, target_logits, target_edge_index):
+        source_divergence = self._divergence(source_logits)
+        cutoff = source_divergence.kthvalue(self.source_rank).values
+        if self.threshold is None:
+            self.threshold = cutoff
+        else:
+            self.threshold = self.beta * self.threshold + (1 - self.beta) * cutoff
+
+        candidate = self._divergence(target_logits) < self.threshold
+        edge_from, edge_to = target_edge_index
+        supported = torch.zeros_like(candidate)
+        supporting_edges = candidate[edge_from] & (edge_from != edge_to)
+        supported.index_fill_(0, edge_to[supporting_edges], True)
+        unknown = candidate & supported
+        return torch.where(~unknown), torch.where(unknown)
+
 def get_neighbors(logits_source, logits_target, topk, device):
-    prob_t, prob_s = F.softmax(logits_target.detach().cpu(), dim=1), F.softmax(logits_source.detach().cpu(), dim=1) #s:[n,m],t:[k,m]
+    prob_t, prob_s = F.softmax(logits_target.detach().cpu(), dim=1), F.softmax(logits_source.detach().cpu(), dim=1)
     rank_t = prob_t
     rank_idx_t = torch.argsort(rank_t, dim = 1, descending = True)
     rank_idx_t_aug = rank_idx_t.repeat(prob_s.size(0), 1)
@@ -150,7 +178,7 @@ def get_neighbors(logits_source, logits_target, topk, device):
     neighbor[rank_diff > 0] = 0
     neighbors = neighbor.view(prob_t.size(0),-1)
 
-    return neighbors #[k,n]
+    return neighbors
 
 
 def calculate_prototypes(nodes_num, node_embeddings, labels):
@@ -181,17 +209,6 @@ def neighbor_contrastive_loss(source_embedding, target_embedding, neighbor_mask,
 
     loss = neighbor_similarity.mean()
     return loss
-
-
-def distinguish_target(target_logits, beta, gamma, threshold, device):
-    target_logits = torch.softmax(target_logits, dim=1)
-    max_logits, _ = torch.max(target_logits, dim=1)
-
-
-    known_index = torch.where(max_logits >= threshold)
-    unknown_index = torch.where(max_logits < threshold)
-
-    return known_index, unknown_index
 
 
 def neighbor_center_contrastive_loss(source_embedding, target_embedding, unknown_index, labels, device, temperature=0.5):
